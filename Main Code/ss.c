@@ -12,9 +12,12 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <time.h>
+#include <errno.h>
 char current_dir[4096];
 #define BUFFER_SIZE 4096
 #define PATH_MAX 4096
+#define COPY_MANIFEST_SIZE 10000
+#define COPY_STREAM_CHUNK 1000
 typedef struct ss_info // struct used to send to naming server for a particular ss info
 {
     char ip_address[15];
@@ -50,7 +53,7 @@ void getLastPathComponent(const char *path, char *result) {
         strcpy(result, path); // If no slash is found, copy the entire path
     }
 }
-void copyFile(const char *srcPath, const char *destPath)
+int copyFile(const char *srcPath, const char *destPath)
 {
     int srcFile, destFile;
     ssize_t bytesRead, bytesWritten;
@@ -60,7 +63,7 @@ void copyFile(const char *srcPath, const char *destPath)
     if (srcFile == -1)
     {
         perror("Error opening source file");
-        return;
+        return -1;
     }
 
     destFile = open(destPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -68,7 +71,7 @@ void copyFile(const char *srcPath, const char *destPath)
     {
         perror("Error creating or opening destination file");
         close(srcFile);
-        return;
+        return -1;
     }
 
     while ((bytesRead = read(srcFile, buffer, BUFFER_SIZE)) > 0)
@@ -79,17 +82,24 @@ void copyFile(const char *srcPath, const char *destPath)
             perror("Error writing to destination file");
             close(srcFile);
             close(destFile);
-            return;
+            return -1;
         }
+    }
+    if (bytesRead < 0)
+    {
+        perror("Error reading source file");
+        close(srcFile);
+        close(destFile);
+        return -1;
     }
 
     close(srcFile);
     close(destFile);
+    return 0;
 }
 
-void copyDirectory(const char *srcDir, const char *destDir)
+int copyDirectory(const char *srcDir, const char *destDir)
 {
-    printf("in the f\n");
     DIR *dir;
     struct dirent *entry;
     struct stat statBuf;
@@ -99,27 +109,28 @@ void copyDirectory(const char *srcDir, const char *destDir)
     if (lstat(srcDir, &statBuf) == -1)
     {
         perror("Error getting file status");
-        return;
+        return -1;
     }
 
     if (S_ISREG(statBuf.st_mode))
     { // If source path is a file
-        copyFile(srcDir, destDir);
-        return;
+        return copyFile(srcDir, destDir);
     }
 
     if ((dir = opendir(srcDir)) == NULL)
     {
         perror("Error opening source directory");
-        return;
+        return -1;
     }
 
-    // if (mkdir(destDir, 0755) == -1 && errno != EEXIST) {
-    mkdir(destDir, 0755);
-    //     perror("Error creating destination directory");
-    //     closedir(dir);
-    //     return;
-    // }
+    if (mkdir(destDir, 0755) == -1 && errno != EEXIST)
+    {
+        perror("Error creating destination directory");
+        closedir(dir);
+        return -1;
+    }
+
+    int status = 0;
 
     while ((entry = readdir(dir)) != NULL)
     {
@@ -132,20 +143,86 @@ void copyDirectory(const char *srcDir, const char *destDir)
         if (lstat(srcPath, &statBuf) == -1)
         {
             perror("Error getting file status");
+            status = -1;
             continue;
         }
 
         if (S_ISDIR(statBuf.st_mode))
         {
-            copyDirectory(srcPath, destPath);
+            if (copyDirectory(srcPath, destPath) != 0)
+            {
+                status = -1;
+            }
         }
         else if (S_ISREG(statBuf.st_mode))
         {
-            copyFile(srcPath, destPath);
+            if (copyFile(srcPath, destPath) != 0)
+            {
+                status = -1;
+            }
         }
     }
 
     closedir(dir);
+    return status;
+}
+
+void buildParentPath(const char *path, char *parent, size_t parent_size)
+{
+    strncpy(parent, path, parent_size - 1);
+    parent[parent_size - 1] = '\0';
+
+    char *lastSlash = strrchr(parent, '/');
+    if (lastSlash == NULL)
+    {
+        strcpy(parent, ".");
+        return;
+    }
+
+    *lastSlash = '\0';
+    if (parent[0] == '\0')
+    {
+        strcpy(parent, "/");
+    }
+}
+
+int copyPathIntoDirectory(const char *srcPath, const char *destDirectory)
+{
+    struct stat srcStat;
+    struct stat destStat;
+    char baseName[PATH_MAX];
+    char destPath[PATH_MAX];
+
+    if (lstat(srcPath, &srcStat) == -1)
+    {
+        perror("Error getting source path status");
+        return -1;
+    }
+    if (stat(destDirectory, &destStat) == -1)
+    {
+        perror("Error getting destination path status");
+        return -1;
+    }
+    if (!S_ISDIR(destStat.st_mode))
+    {
+        fprintf(stderr, "Destination path must be a directory\n");
+        return -1;
+    }
+
+    getLastPathComponent(srcPath, baseName);
+    snprintf(destPath, sizeof(destPath), "%s/%s", destDirectory, baseName);
+
+    if (S_ISDIR(srcStat.st_mode))
+    {
+        return copyDirectory(srcPath, destPath);
+    }
+    if (S_ISREG(srcStat.st_mode))
+    {
+        return copyFile(srcPath, destPath);
+    }
+
+    fprintf(stderr, "Unsupported source path type for copy\n");
+    return -1;
 }
 void peekkar(char *path)
 {
@@ -232,42 +309,26 @@ void sendFileData(const char *filePath, int client_socket)
         return;
     }
 
-    int chunk_size = 1e3;
-    char *arr = (char *)malloc(sizeof(char) * chunk_size );
-    memset(arr, '\0', chunk_size );
-
     long long int file_size = lseek(file_desc, 0, SEEK_END);
     lseek(file_desc, 0, SEEK_SET);
-    long long int count = 0;
+    send(client_socket, &file_size, sizeof(file_size), 0);
 
-    while (count < file_size)
+    char buffer[COPY_STREAM_CHUNK];
+    while (1)
     {
-        // usleep(100);
-        if (file_size - count < chunk_size-1)
+        ssize_t bytes_read = read(file_desc, buffer, sizeof(buffer));
+        if (bytes_read < 0)
         {
-            memset(arr, '\0', chunk_size);
-            int len = read(file_desc, arr, file_size - count);
-            send(client_socket, arr, strlen(arr), 0);
-            memset(arr, '\0', chunk_size);
-            count = file_size;
+            perror("Error reading file for copy");
+            break;
         }
-        else
+        if (bytes_read == 0)
         {
-            memset(arr, '\0', chunk_size);
-            int len = read(file_desc, arr, chunk_size-1);
-            send(client_socket, arr, chunk_size, 0);
-            memset(arr, '\0', chunk_size);
-            count += chunk_size-1;
+            break;
         }
-        // recv(client_socket,arr,chunk_size,0);  //ack-kushal
+        send(client_socket, buffer, bytes_read, 0);
     }
 
-    char ack[100];
-    strcpy(ack, "{.{.{ST");
-    strcat(ack, "OP}.}.}\0");
-    send(client_socket, ack, strlen(ack), 0);
-    free(arr);
-    // Close the file
     close(file_desc);
 }
 
@@ -432,197 +493,138 @@ void SEND_DATA(char *currentDirectory, char *filePaths, int client_socket)
     free(pathCopy);
     free(token);
 }
-void fileordir(char *path,char all_files[10000], int *count, char *curr_dir, int new_socket,char* g_c_d)
+void fileordir(char *path, char all_files[COPY_MANIFEST_SIZE], int *count, int new_socket)
 {
-    
     struct stat path_stat;
-    if (stat(path, &path_stat) == 0) {
-        if (S_ISREG(path_stat.st_mode)) {
+    memset(all_files, '\0', COPY_MANIFEST_SIZE);
+
+    if (stat(path, &path_stat) == 0)
+    {
+        if (S_ISREG(path_stat.st_mode))
+        {
             char to_be_concat[500];
-            memset(to_be_concat,'\0',500);
-            // printf("%s is a regular file.\n", path);
-            // relative_path_calc_copy(to_be_concat, full_path, curr_dir);
-            getLastPathComponent(path,to_be_concat);
-            strcpy(all_files, "{.{F}.}");
-            strcat(all_files, to_be_concat);
-            // strcat(all_files, '\0');
-
-
-            strcat(all_files, "$\0");
+            memset(to_be_concat, '\0', sizeof(to_be_concat));
+            getLastPathComponent(path, to_be_concat);
+            snprintf(all_files, COPY_MANIFEST_SIZE, "{.{F}.}%s$", to_be_concat);
             printf("%s\n", all_files);
-            send(new_socket, all_files, strlen(all_files), 0);
-            char dummy[1000];
-        // recv(ns_communication_socket,dummy,1000,0); //future
+            send(new_socket, all_files, COPY_MANIFEST_SIZE, 0);
             sendFileData(path, new_socket);
+        }
+        else if (S_ISDIR(path_stat.st_mode))
+        {
+            char parent_dir[PATH_MAX];
+            char root_name[PATH_MAX];
 
-
-
-        } else if (S_ISDIR(path_stat.st_mode)) {
-            // printf("%s is a directory.\n", path);
-            copy_peekkar(path, all_files, count, curr_dir, new_socket);
-            send(new_socket, all_files, strlen(all_files), 0);
-            // char dummy[1000];
-            // recv(ns_communication_socket,dummy,1000,0); //future
-            SEND_DATA(path, all_files, new_socket);
-            // SEND_DATA(g_c_d, all_files, new_socket);
-        } else {
+            buildParentPath(path, parent_dir, sizeof(parent_dir));
+            getLastPathComponent(path, root_name);
+            snprintf(all_files, COPY_MANIFEST_SIZE, "{.{D}.}%s$", root_name);
+            copy_peekkar(path, all_files, count, parent_dir, new_socket);
+            send(new_socket, all_files, COPY_MANIFEST_SIZE, 0);
+            SEND_DATA(parent_dir, all_files, new_socket);
+        }
+        else
+        {
             printf("%s is neither a file nor a directory.\n", path);
         }
-    } else {
+    }
+    else
+    {
         perror("Error");
     }
-
 }
-void createFilesAndDirectories(const char *currentDirectory, char *filePaths, int client_socket)
+int createFilesAndDirectories(const char *currentDirectory, char *filePaths, int client_socket)
 {
-    // char filePaths[5000] = "{.{F}.}s.c${.{D}.}check_1${.{D}.}check_1/check_3${.{F}.}check_1/check_3/f_5.c${.{F}.}check_1/f_1.c${.{F}.}check_1/f_2.c${.{D}.}check_2${.{F}.}check_2/f_4.c${.{F}.}s${.{F}.}a.out${.{D}.}client${.{F}.}client/a.out${.{F}.}client/c.c$";
     char *pathCopy = strdup(filePaths);
+    if (pathCopy == NULL)
+    {
+        perror("strdup");
+        return -1;
+    }
     char *token = strtok(pathCopy, "$");
-
-    // char* token =(char*)calloc(MAX_BUFFER_SIZE,sizeof(char));
-    // int stop_received = 0;
+    int overall_status = 0;
 
     while (token != NULL)
     {
-        // memset(token, 0, MAX_BUFFER_SIZE);
-        // recv(client_socket, token, MAX_BUFFER_SIZE, 0);
-
         printf("Received: %s\n", token);
 
-        // Check for directory or file indicator at the beginning of the path
         if (strncmp(token, "{.{D}.}", 7) == 0)
         {
-            // Directory path
-            const char *directoryPath = token + 7; // Skip the indicator "{.{D}.}"
+            const char *directoryPath = token + 7;
             char right_path[1000];
 
-            strcpy(right_path, currentDirectory);
-            strcat(right_path, "/");
-            strcat(right_path, directoryPath);
+            snprintf(right_path, sizeof(right_path), "%s/%s", currentDirectory, directoryPath);
             printf("Creating directory: %s\n", right_path);
-            if (mkdir(right_path, 0777) == -1)
+            if (mkdir(right_path, 0777) == -1 && errno != EEXIST)
             {
                 perror("Error creating directory");
+                overall_status = -1;
             }
-
-            memset(right_path, '\0', 1000);
         }
         else if (strncmp(token, "{.{F}.}", 7) == 0)
         {
-            // File path
-            const char *filePath = token + 7; // Skip the indicator "{.{F}.}"
-
-            char currentPath[5000] = "";
+            const char *filePath = token + 7;
+            char currentPath[5000];
             snprintf(currentPath, sizeof(currentPath), "%s/%s", currentDirectory, filePath);
-            int failed = 0;
-            int success = 1;
-            int res = 5;
             printf("Opening/Creating file: %s\n", currentPath);
-            FILE *file = fopen(currentPath, "a+");
+
+            FILE *file = fopen(currentPath, "wb");
             if (file == NULL)
             {
                 perror("Error opening/creating file");
-                // res = send(client_socket, &failed, sizeof(failed), 0);
-                // printf("%d\n", res);
+                overall_status = -1;
             }
-            else
+
+            long long int remaining_bytes = 0;
+            if (recv(client_socket, &remaining_bytes, sizeof(remaining_bytes), MSG_WAITALL) <= 0)
             {
-                fclose(file); // Close the file
-                // res= send(client_socket,&success,sizeof(success),0);
-                // printf("%d\n",res);
-                //    char *data_received = (char *)malloc(sizeof(char) * 1e5);
-                //     while (1) {
-                //         int len = recv(client_socket, data_received, 1e5, 0);
-
-                //         if (len <= 0) {
-                //             // Handle the case when the received data length is zero or less (indicating the end of transmission)
-                //             break;
-                //         }
-
-                //         if (strstr(data_received, "{.{.{STOP}.}.}") != NULL) {
-                //             break; // STOP signal received
-                //         }
-
-                //         // Write the received data into the file
-                //         size_t bytes_written = fwrite(data_received, 1, len, file);
-
-                //         if (bytes_written != len) {
-                //             // Handle error writing data to file
-                //             perror("Error writing data to file");
-                //             break;
-                //         }
-
-                //         memset(data_received, '\0', 1e5);
-                //     }
-
-                //     fclose(file);
-                //     sleep(0.01);
-                //     // int cont=1;
-                //     // recv(client_socket,&cont,sizeof(cont),0);
-                //     free(data_received);
-
-                char *data_recieved = (char *)malloc(sizeof(char) * 1e3 );
-
-                while (1)
+                if (file != NULL)
                 {
-                    memset(data_recieved, '\0', 1e3 );
-                    int len = recv(client_socket, data_recieved, 1e3-1, 0);
-
-                    if (len <= 0)
-                    {
-                        // printf("Error receiving data\n");
-                        break;
-                    }
-
-                    data_recieved[len] = '\0'; // Null-terminate the received data
-                    // printf("%s\n",data_recieved);
-                    char *stop_ptr = strstr(data_recieved, "{.{.{STOP}.}.}");
-                    if (stop_ptr != NULL)
-                    {
-                        // Calculate the position of the stop string in the received data
-                        int stop_position = stop_ptr - data_recieved;
-
-                        // Open the file for writing
-                        FILE *file = fopen(currentPath, "a+");
-                        if (file == NULL)
-                        {
-                            perror("Error opening file");
-                            break;
-                        }
-
-                        // Write the portion of data received before the STOP string
-                        fwrite(data_recieved, sizeof(char), stop_position, file);
-                        // send(client_socket,data_recieved,strlen(data_recieved),0); future
-
-                        fclose(file); // Close the file
-
-                        break; // STOP signal received
-                    }
-
-                    // Open the file for writing
-                    FILE *file = fopen(currentPath, "a+");
-                    if (file == NULL)
-                    {
-                        perror("Error opening file");
-                        break;
-                    }
-
-                    // Write the entire data received to the file if STOP string is not found yet
-                    fwrite(data_recieved, sizeof(char), len, file);
-                    // send(client_socket,data_recieved,strlen(data_recieved),0);  future
-
-                    fclose(file); // Close the file
+                    fclose(file);
                 }
+                free(pathCopy);
+                return -1;
             }
-            // memset(token, 0, MAX_BUFFER_SIZE);
+
+            while (remaining_bytes > 0)
+            {
+                char data_received[COPY_STREAM_CHUNK];
+                int to_read = remaining_bytes > COPY_STREAM_CHUNK ? COPY_STREAM_CHUNK : (int)remaining_bytes;
+                int len = recv(client_socket, data_received, to_read, 0);
+
+                if (len <= 0)
+                {
+                    if (file != NULL)
+                    {
+                        fclose(file);
+                    }
+                    free(pathCopy);
+                    return -1;
+                }
+
+                if (file != NULL)
+                {
+                    if (fwrite(data_received, sizeof(char), len, file) != (size_t)len)
+                    {
+                        perror("Error writing data to file");
+                        fclose(file);
+                        file = NULL;
+                        overall_status = -1;
+                    }
+                }
+                remaining_bytes -= len;
+            }
+
+            if (file != NULL)
+            {
+                fclose(file);
+            }
         }
 
         token = strtok(NULL, "$");
     }
-    memset(token,'\0',5000);
+
     free(pathCopy);
-    free(token);
-    // printf("copying done\n");
+    return overall_status;
 }
 
 void read_file_ss(char *filePath, int client_id)
@@ -996,7 +998,6 @@ void *handle_ns_request(void *socket_desc)
         // printf("all_files sent to the NMS.\n");
 
         char src_path[1000];
-        int bytes;
         memset(src_path, '\0', sizeof(src_path));
         if (recv(ns_communication_socket, src_path, sizeof(src_path), 0) < 0)
         {
@@ -1005,7 +1006,7 @@ void *handle_ns_request(void *socket_desc)
         }
 
         printf("path recieved at source SS is %s\n", src_path);
-        char all_files[10000];
+        char all_files[COPY_MANIFEST_SIZE];
         int count = 0;
         char curr_dir[2000];
         getcwd(curr_dir, 2000);
@@ -1014,21 +1015,7 @@ void *handle_ns_request(void *socket_desc)
         strcat(comp_src_path, "/");
         strcat(comp_src_path, src_path);
         printf("path passed - %s\n", comp_src_path);
-        // strcat(all_files,"{.{D}.}");
-        // strcat(all_files,);
-
-        fileordir(comp_src_path, all_files, &count, comp_src_path, ns_communication_socket,curr_dir);
-        // send(ns_communication_socket, all_files, strlen(all_files), 0);
-        // char dummy[1000];
-        // // recv(ns_communication_socket,dummy,1000,0); //future
-        // SEND_DATA(curr_dir, all_files, ns_communication_socket);
-        // SEND_DATA(comp_src_path, all_files, ns_communication_socket);
-        char done[100];
-        strcpy(done, "{.{NS_");
-        strcat(done, "Done}.}\0");
-
-        send(ns_communication_socket, done, strlen(done), 0);
-
+        fileordir(comp_src_path, all_files, &count, ns_communication_socket);
         printf("all_files sent to the NMS.\n");
     }
     else if (choice == 13)
@@ -1041,19 +1028,25 @@ void *handle_ns_request(void *socket_desc)
             return NULL;
         }
         printf("path recieved at dest SS is %s\n", dest_path);
-        char token[5000];
-        int MAX_BUFFER_SIZE = 1e3;
+        char token[COPY_MANIFEST_SIZE];
         memset(token, '\0', sizeof(token));
-        recv(ns_communication_socket, token, MAX_BUFFER_SIZE, 0);
+        if (recv(ns_communication_socket, token, sizeof(token), 0) <= 0)
+        {
+            printf("Couldn't receive manifest\n");
+            return NULL;
+        }
 
-        // send(ns_communication_socket, token, strlen(all_files), 0); future
-
-        char curr_dir[2000];
-        // getcwd(curr_dir,2000);
-        // strcat(curr_dir,"/");
-        strcat(curr_dir, dest_path);
-        printf("path passed - %s\n", curr_dir);
-        createFilesAndDirectories(curr_dir, token, ns_communication_socket);
+        char curr_dir[PATH_MAX];
+        char dest_root[PATH_MAX];
+        if (getcwd(curr_dir, sizeof(curr_dir)) == NULL)
+        {
+            perror("getcwd");
+            return NULL;
+        }
+        snprintf(dest_root, sizeof(dest_root), "%s/%s", curr_dir, dest_path);
+        printf("path passed - %s\n", dest_root);
+        int copy_status = createFilesAndDirectories(dest_root, token, ns_communication_socket);
+        send(ns_communication_socket, &copy_status, sizeof(copy_status), 0);
     }
     else if (choice == 14)
     {
@@ -1065,7 +1058,8 @@ void *handle_ns_request(void *socket_desc)
             return NULL;
         }
         printf("path recieved at source SS is %s\n", src_path);
-        char all_files[10000];
+        char all_files[COPY_MANIFEST_SIZE];
+        memset(all_files, '\0', sizeof(all_files));
         int count = 0;
         char curr_dir[2000];
         getcwd(curr_dir, 2000);
@@ -1078,43 +1072,47 @@ void *handle_ns_request(void *socket_desc)
         // strcat(all_files,);
 
         copy_peekkar(comp_src_path, all_files, &count, comp_src_path, ns_communication_socket);
-        send(ns_communication_socket, all_files, strlen(all_files), 0);
-        char dummy[1000];
-        // recv(ns_communication_socket,dummy,1000,0); //future
+        send(ns_communication_socket, all_files, COPY_MANIFEST_SIZE, 0);
         SEND_DATA(comp_src_path, all_files, ns_communication_socket);
-        char done[100];
-        strcpy(done, "{.{NS_");
-        strcat(done, "Done}.}\0");
-
-        send(ns_communication_socket, done, strlen(done), 0);
-
         printf("all_files sent to the NMS.\n");
     }
-    else if(choice=15)
+    else if (choice == 15)
     {
         char src_path[1000];
         memset(src_path, '\0', sizeof(src_path));
-        if (recv(ns_communication_socket, src_path, sizeof(src_path), 0) < 0)
+        if (recv(ns_communication_socket, src_path, sizeof(src_path), 0) <= 0)
         {
             printf("Couldn't receive\n");
             return NULL;
         }
-        // printf("path recieved at source SS is %s\n", src_path);
-        send(ns_communication_socket,src_path,strlen(src_path),0);
         char dest_path[1000];
         memset(dest_path, '\0', sizeof(dest_path));
-        if (recv(ns_communication_socket, dest_path, sizeof(dest_path), 0) < 0)
+        if (recv(ns_communication_socket, dest_path, sizeof(dest_path), 0) <= 0)
         {
             printf("Couldn't receive\n");
             return NULL;
         }
-        // printf("path recieved at dest SS is %s\n", dest_path);
-        copyDirectory(src_path,dest_path);
-        // printf("GG\n");
+        char curr_dir[PATH_MAX];
+        char comp_src_path[PATH_MAX];
+        char comp_dest_path[PATH_MAX];
+        int copy_status = -1;
+
+        if (getcwd(curr_dir, sizeof(curr_dir)) == NULL)
+        {
+            perror("getcwd");
+            send(ns_communication_socket, &copy_status, sizeof(copy_status), 0);
+            return NULL;
+        }
+
+        snprintf(comp_src_path, sizeof(comp_src_path), "%s/%s", curr_dir, src_path);
+        snprintf(comp_dest_path, sizeof(comp_dest_path), "%s/%s", curr_dir, dest_path);
+        copy_status = copyPathIntoDirectory(comp_src_path, comp_dest_path);
+        send(ns_communication_socket, &copy_status, sizeof(copy_status), 0);
 
     }
     // Close the client socket
     close(ns_communication_socket);
+    return NULL;
 }
 void *handle_client_request(void *socket_desc)
 {

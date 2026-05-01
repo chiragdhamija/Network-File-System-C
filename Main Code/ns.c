@@ -8,6 +8,10 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 
+#define COPY_PATH_BUFFER 1000
+#define COPY_MANIFEST_SIZE 10000
+#define COPY_STREAM_CHUNK 1000
+
 typedef struct filesll
 {
     char name[256];
@@ -864,7 +868,30 @@ int delete_file(char *path, int choice) // change made
     return returned_value; // change made
 }
 
-void copy_spec6(char *src_path, char *dest_path, int choice)
+int count_copy_files(const char *manifest)
+{
+    int count = 0;
+    char *manifest_copy = strdup(manifest);
+    if (manifest_copy == NULL)
+    {
+        return -1;
+    }
+
+    char *token = strtok(manifest_copy, "$");
+    while (token != NULL)
+    {
+        if (strncmp(token, "{.{F}.}", 7) == 0)
+        {
+            count++;
+        }
+        token = strtok(NULL, "$");
+    }
+
+    free(manifest_copy);
+    return count;
+}
+
+int copy_spec6(char *src_path, char *dest_path, int choice)
 {
     printf("paths sent to func copy_spec6 : %s %s", src_path, dest_path);
 
@@ -881,6 +908,7 @@ void copy_spec6(char *src_path, char *dest_path, int choice)
             fprintf(book, "No such source path exists\n");
             fclose(book);
             pthread_mutex_unlock(&booklock);
+            return -1;
         }
     }
     NS_to_client found_dest = find_from_ss(dest_path);
@@ -893,11 +921,12 @@ void copy_spec6(char *src_path, char *dest_path, int choice)
 
         fclose(book);
         pthread_mutex_unlock(&booklock);
+        return -1;
     }
     int ns_socket_src, ns_socket_dest;
     struct sockaddr_in ss_address_src, ss_address_dest;
 
-    if (choice == 6 && strcmp(found_dest.client_port,found_src.client_port)==0)
+    if (choice == 6 && strcmp(found_dest.client_port, found_src.client_port) == 0)
     {
         if ((ns_socket_src = socket(AF_INET, SOCK_STREAM, 0)) == -1)
         {
@@ -905,7 +934,7 @@ void copy_spec6(char *src_path, char *dest_path, int choice)
             book = fopen("book.txt", "a+");
             fprintf(book, "Socket creation failed\n");
             fclose(book);
-            return ;
+            return -1;
         }
         ss_address_src.sin_family = AF_INET;
         ss_address_src.sin_addr.s_addr = inet_addr(found_src.ip_address);
@@ -917,22 +946,24 @@ void copy_spec6(char *src_path, char *dest_path, int choice)
 
             fprintf(book, "Connection failed\n");
             fclose(book);
-            return;
+            close(ns_socket_src);
+            return -1;
         }
-        int src_ss=15; // same source and destination
+        int src_ss = 15;
+        int copy_status = -1;
         printf("same source dest case\n");
         send(ns_socket_src, &src_ss, sizeof(src_ss), 0);
-        char both[5000];
-        memset(both,'\0',5000);
-        strcpy(both,src_path);
-        // strcat(both,"$");
-        // strcat(both,dest_path);
-        send(ns_socket_src, both, strlen(both), 0);
-        recv(ns_socket_src,src_path,strlen(src_path),0);
-        send(ns_socket_src, dest_path, strlen(dest_path), 0);
+        send(ns_socket_src, src_path, COPY_PATH_BUFFER, 0);
+        send(ns_socket_src, dest_path, COPY_PATH_BUFFER, 0);
+        if (recv(ns_socket_src, &copy_status, sizeof(copy_status), 0) <= 0)
+        {
+            close(ns_socket_src);
+            return -1;
+        }
+        close(ns_socket_src);
         printf("all sent\n");
-        return;
-    } 
+        return copy_status;
+    }
 
     if ((ns_socket_src = socket(AF_INET, SOCK_STREAM, 0)) == -1)
     {
@@ -943,10 +974,8 @@ void copy_spec6(char *src_path, char *dest_path, int choice)
 
         fclose(book);
         pthread_mutex_unlock(&booklock);
-        return;
+        return -1;
     }
-    // printf("to be connected on %d and address %s\n", atoi(found_src.ded_nm_port), found_src.ip_address);
-    // Set up server address structure
     if (choice == 6)
     {
         ss_address_src.sin_family = AF_INET;
@@ -969,7 +998,8 @@ void copy_spec6(char *src_path, char *dest_path, int choice)
         fprintf(book, "Connection failed\n");
         fclose(book);
         pthread_mutex_unlock(&booklock);
-        return;
+        close(ns_socket_src);
+        return -1;
     }
 
     if ((ns_socket_dest = socket(AF_INET, SOCK_STREAM, 0)) == -1)
@@ -982,19 +1012,19 @@ void copy_spec6(char *src_path, char *dest_path, int choice)
         fclose(book);
         pthread_mutex_unlock(&booklock);
 
-        return;
+        close(ns_socket_src);
+        return -1;
     }
-    // printf("to be connected on %d and address %s\n", atoi(found_dest.ded_nm_port), found_dest.ip_address);
-    // Set up server address structure
     ss_address_dest.sin_family = AF_INET;
     ss_address_dest.sin_addr.s_addr = inet_addr(found_dest.ip_address);
     ss_address_dest.sin_port = htons(atoi(found_dest.ded_nm_port));
 
-    // Connect to the server
     if (connect(ns_socket_dest, (struct sockaddr *)&ss_address_dest, sizeof(ss_address_dest)) == -1)
     {
         perror("Connection failed");
-        return;
+        close(ns_socket_src);
+        close(ns_socket_dest);
+        return -1;
     }
     int src_ss = 12;
     int dest_ss = 13;
@@ -1009,9 +1039,8 @@ void copy_spec6(char *src_path, char *dest_path, int choice)
     }
 
     send(ns_socket_dest, &dest_ss, sizeof(dest_ss), 0);
-
-    send(ns_socket_src, src_path, strlen(src_path), 0);
-    send(ns_socket_dest, dest_path, strlen(dest_path), 0);
+    send(ns_socket_src, src_path, COPY_PATH_BUFFER, 0);
+    send(ns_socket_dest, dest_path, COPY_PATH_BUFFER, 0);
     pthread_mutex_lock(&booklock);
     book = fopen("book.txt", "a+");
 
@@ -1019,31 +1048,85 @@ void copy_spec6(char *src_path, char *dest_path, int choice)
     fclose(book);
     pthread_mutex_unlock(&booklock);
 
-    char received_data[1005];
-    while (1)
+    char manifest[COPY_MANIFEST_SIZE];
+    memset(manifest, '\0', sizeof(manifest));
+    if (recv(ns_socket_src, manifest, sizeof(manifest), 0) <= 0)
     {
-        memset(received_data, '\0', sizeof(received_data));
-        recv(ns_socket_src, received_data, sizeof(received_data), 0);
-        if (strstr(received_data, "{.{NS_Done}.}") != NULL)
-        {
-            pthread_mutex_lock(&booklock);
-            book = fopen("book.txt", "a+");
-
-            fprintf(book, "Copy Completed\n");
-            fclose(book);
-            pthread_mutex_unlock(&booklock);
-            char stop[100];
-            strcpy(stop, "{.{.{STOP}.}.}\0");
-            printf("copy done\n");
-            send(ns_socket_dest, stop, strlen(stop), 0);
-            break;
-        }
-        send(ns_socket_dest, received_data, sizeof(received_data), 0);
-        memset(received_data, '\0', sizeof(received_data));
-        // recv(ns_socket_dest, received_data, sizeof(received_data), 0);
-        // // printf("1\n");  // future
-        // send(ns_socket_src, received_data, sizeof(received_data), 0);
+        close(ns_socket_src);
+        close(ns_socket_dest);
+        return -1;
     }
+    if (send(ns_socket_dest, manifest, sizeof(manifest), 0) <= 0)
+    {
+        close(ns_socket_src);
+        close(ns_socket_dest);
+        return -1;
+    }
+
+    int files_to_copy = count_copy_files(manifest);
+    if (files_to_copy < 0)
+    {
+        close(ns_socket_src);
+        close(ns_socket_dest);
+        return -1;
+    }
+
+    for (int i = 0; i < files_to_copy; i++)
+    {
+        long long int file_size = 0;
+        if (recv(ns_socket_src, &file_size, sizeof(file_size), MSG_WAITALL) <= 0)
+        {
+            close(ns_socket_src);
+            close(ns_socket_dest);
+            return -1;
+        }
+        if (send(ns_socket_dest, &file_size, sizeof(file_size), 0) <= 0)
+        {
+            close(ns_socket_src);
+            close(ns_socket_dest);
+            return -1;
+        }
+
+        long long int remaining_bytes = file_size;
+        char received_data[COPY_STREAM_CHUNK];
+        while (remaining_bytes > 0)
+        {
+            int to_read = remaining_bytes > COPY_STREAM_CHUNK ? COPY_STREAM_CHUNK : (int)remaining_bytes;
+            int bytes_received = recv(ns_socket_src, received_data, to_read, 0);
+            if (bytes_received <= 0)
+            {
+                close(ns_socket_src);
+                close(ns_socket_dest);
+                return -1;
+            }
+            if (send(ns_socket_dest, received_data, bytes_received, 0) <= 0)
+            {
+                close(ns_socket_src);
+                close(ns_socket_dest);
+                return -1;
+            }
+            remaining_bytes -= bytes_received;
+        }
+    }
+
+    pthread_mutex_lock(&booklock);
+    book = fopen("book.txt", "a+");
+
+    fprintf(book, "Copy Completed\n");
+    fclose(book);
+    pthread_mutex_unlock(&booklock);
+    printf("copy done\n");
+
+    int copy_status = -1;
+    if (recv(ns_socket_dest, &copy_status, sizeof(copy_status), 0) <= 0)
+    {
+        close(ns_socket_src);
+        close(ns_socket_dest);
+        return -1;
+    }
+    close(ns_socket_src);
+    close(ns_socket_dest);
+    return copy_status;
 }
 
 void *handle_ss_connection(void *socket_desc)
@@ -1365,14 +1448,21 @@ void *handle_client_connection(void *socekt_desc)
         pthread_mutex_unlock(&booklock);
 
         fflush(stdout);
-        copy_spec6(src_path, dest_path, choice);
+        int copy_status = copy_spec6(src_path, dest_path, choice);
 
         char donemessage[1000];
-        strcpy(donemessage, "ACK");
+        if (copy_status == 0)
+        {
+            strcpy(donemessage, "ACK");
+        }
+        else
+        {
+            strcpy(donemessage, "NACK");
+        }
         pthread_mutex_lock(&booklock);
         book = fopen("book.txt", "a+");
 
-        fprintf(book, "Acknowledgement : Copy\n");
+        fprintf(book, "Acknowledgement : Copy %s\n", donemessage);
         fclose(book);
         pthread_mutex_unlock(&booklock);
         send(communication_client_socket, donemessage, strlen(donemessage), 0);
